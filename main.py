@@ -19,6 +19,7 @@ if not token:
     raise RuntimeError("DISCORD_TOKEN is not set in .env")
 
 URL = "https://api.beertech.com/singularity/graphql"
+LOCATOR_URL = "https://www.busch.com/locator"
 STATE_PATH = BASE_DIR / "busch_state.json"
 LOG_PATH = BASE_DIR / "discord.log"
 DEFAULT_ZIP = os.getenv("BUSCH_ZIP", "97333")
@@ -42,34 +43,6 @@ TRACKED_CATEGORIES = {
             "BUSCH LIGHT APPLE 48/12 AL CAN",
             "BUSCH LIGHT APPLE 24/16 OZ CAN 4/6",
             "BUSCH LIGHT APPLE 1/2 BBL SV",
-        ],
-    },
-    "lite": {
-        "brand_name": "BUSCH LIGHT",
-        "role_name": "Busch Lite Alerts",
-        "emoji": "🍺",
-        "products": [
-            "BUSCH LIGHT 18/12 OZ NRLN",
-            "BUSCH LIGHT 24/12 OZ CAN 2/12",
-            "BUSCH LIGHT 15/25 AL CAN SHRINK",
-            "BUSCH LIGHT 24/12 OZ CAN 4/6",
-            "BUSCH LIGHT 30/12 AL CAN 2/15 SP CF",
-            "BUSCH LIGHT 24/16 OZ CAN 4/6",
-            "BUSCH LIGHT 18/12 OZ CAN",
-            "BUSCH LIGHT 24/12 OZ NRLN 2/12",
-            "BUSCH LIGHT 18/16 OZ CAN",
-            "BUSCH LIGHT 24/12 OZ NRLN BOX",
-            "BUSCH LIGHT 24/12 OZ CAN",
-            "BUSCH LIGHT 15/16 OZ CALNR CF",
-            "BUSCH LIGHT 30/12 OZ CAN DSTK",
-            "BUSCH LIGHT 24/12 OZ NRLN 4/6",
-            "BUSCH LIGHT 24/16 OZ CAN",
-            "BUSCH LIGHT 36/12 OZ CAN DSTK",
-            "BUSCH LIGHT 24/16 OZ CAN 6/4",
-            "BUSCH LIGHT 24/16 OZ CALNR",
-            "BUSCH LIGHT 15/25 AL CAN 5/3 SHRINK",
-            "BUSCH LIGHT 1/2 BBL SV",
-            "BUSCH LIGHT 24/16 OZ CAN 3/8",
         ],
     },
     "peach": {
@@ -200,6 +173,7 @@ def build_update_embed(category_name, config, zip_code, retailers):
     if retailers:
         embed = discord.Embed(
             title=f"{category_name.title()} update: stock found",
+            url=LOCATOR_URL,
             description=f"{len(retailers)} retailer(s) matched {brand_name}.",
             color=discord.Color.green(),
         )
