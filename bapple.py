@@ -2,16 +2,33 @@ import requests
 import time
 import json
 import os
+import discord
+from discord.ext import commands
+import logging
 from dotenv import load_dotenv
 from pathlib import Path
 
-#dotenv_path= Path('./env')
-print()
+
 load_dotenv()
 
-print()
-URL = "https://api.beertech.com/singularity/graphql"
 webhook_url = os.getenv('WEBHOOK_URL')
+token = os.getenv('DISCORD_TOKEN')
+
+URL = "https://api.beertech.com/singularity/graphql"
+
+handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f"We are ready to go in, {bot.user.name} ")
+
+bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+
 # This is the exact string from your payload
 # We use f-strings so you can change the zipCode or radius easily
 QUERY = """
