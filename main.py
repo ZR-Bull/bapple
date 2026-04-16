@@ -108,6 +108,7 @@ state = {
     "role_panel_channel_id": None,
     "updates_channel_id": None,
     "last_check_key": None,
+    "zip_codes": [DEFAULT_ZIP],
 }
 
 
@@ -127,9 +128,22 @@ def load_state():
         if key in loaded_state:
             state[key] = loaded_state[key]
 
+    if not isinstance(state.get("zip_codes"), list) or not state["zip_codes"]:
+        state["zip_codes"] = [DEFAULT_ZIP]
+
+    state["zip_codes"] = [str(zip_code) for zip_code in state["zip_codes"]]
+
 
 def save_state():
     STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def get_zip_codes():
+    zip_codes = state.get("zip_codes")
+    if not isinstance(zip_codes, list) or not zip_codes:
+        return [DEFAULT_ZIP]
+
+    return [str(zip_code) for zip_code in zip_codes]
 
 
 def build_query(brand_name, zip_code, radius, products):
@@ -180,7 +194,7 @@ async def ensure_role(guild, role_name):
         return None
 
 
-def build_update_embed(category_name, config, retailers):
+def build_update_embed(category_name, config, zip_code, retailers):
     brand_name = config["brand_name"]
 
     if retailers:
@@ -202,7 +216,7 @@ def build_update_embed(category_name, config, retailers):
             color=discord.Color.red(),
         )
 
-    embed.add_field(name="Zip code", value=DEFAULT_ZIP, inline=True)
+    embed.add_field(name="Zip code", value=zip_code, inline=True)
     embed.add_field(name="Radius", value=f"{DEFAULT_RADIUS} mi", inline=True)
     embed.add_field(name="Brand", value=brand_name, inline=False)
     embed.set_footer(text=f"Checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -230,28 +244,33 @@ def get_updates_channel(guild):
 
 
 async def run_all_category_checks(guild, channel):
-    for category_name, config in TRACKED_CATEGORIES.items():
-        try:
-            retailers = await asyncio.to_thread(
-                fetch_retailers,
-                config["brand_name"],
-                DEFAULT_ZIP,
-                DEFAULT_RADIUS,
-                config["products"],
+    for zip_code in get_zip_codes():
+        for category_name, config in TRACKED_CATEGORIES.items():
+            try:
+                retailers = await asyncio.to_thread(
+                    fetch_retailers,
+                    config["brand_name"],
+                    zip_code,
+                    DEFAULT_RADIUS,
+                    config["products"],
+                )
+            except Exception as exc:
+                await channel.send(f"Stock lookup failed for {category_name} at {zip_code}: {exc}")
+                continue
+
+            embed = build_update_embed(category_name, config, zip_code, retailers)
+            if retailers:
+                role = discord.utils.get(guild.roles, name=config["role_name"])
+                mention = role.mention if role else config["role_name"]
+                content = f"{mention} {category_name.title()} stock update for {zip_code}"
+            else:
+                content = f"{category_name.title()} stock update for {zip_code}"
+
+            await channel.send(
+                content=content,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(roles=True),
             )
-        except Exception as exc:
-            await channel.send(f"Stock lookup failed for {category_name}: {exc}")
-            continue
-
-        role = discord.utils.get(guild.roles, name=config["role_name"])
-        mention = role.mention if role else config["role_name"]
-        embed = build_update_embed(category_name, config, retailers)
-
-        await channel.send(
-            content=f"{mention} {category_name.title()} stock update",
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions(roles=True),
-        )
 
 
 async def update_member_role(payload, is_add):
@@ -354,6 +373,8 @@ async def send_help(ctx):
     await ctx.reply(
         "Commands:\n"
         "- `!busch setup` creates roles + pinned reaction panel in this channel\n"
+        "- `!busch zip 97333` adds a zip code to the shared list\n"
+        "- `!busch zip` shows the current zip codes\n"
         "- `!busch channel` sets this channel as update channel\n"
         "- `!busch checknow` runs stock checks right now\n"
         "- `!busch status` shows schedule/channel/panel status\n"
@@ -381,6 +402,13 @@ async def busch_setup(ctx):
         description=(
             "React to get alert roles. Remove your reaction to remove the role.\n\n"
             + "\n".join(role_lines)
+            + "\n\nCommands:\n"
+            + "- `!busch zip 97333` adds a zip code to the shared list\n"
+            + "- `!busch zip` shows the current zip codes\n"
+            + "- `!busch channel` sets this channel as the scheduled updates channel\n"
+            + "- `!busch checknow` runs stock checks immediately\n"
+            + "- `!busch status` shows the current bot setup\n"
+            + "- `!busch help` shows the command summary"
         ),
         color=discord.Color.blurple(),
     )
@@ -397,9 +425,33 @@ async def busch_setup(ctx):
     state["role_panel_message_id"] = panel_message.id
     state["role_panel_channel_id"] = panel_message.channel.id
     state["updates_channel_id"] = ctx.channel.id
+    if not get_zip_codes():
+        state["zip_codes"] = [DEFAULT_ZIP]
     save_state()
 
     await ctx.reply("Setup complete. I pinned the role panel and set this as the update channel.")
+
+
+@busch.command(name="zip")
+async def busch_zip(ctx, zip_code=None):
+    if zip_code is None:
+        await ctx.reply("Current zip codes: " + ", ".join(get_zip_codes()))
+        return
+
+    normalized_zip = str(zip_code).strip()
+    if not (normalized_zip.isdigit() and len(normalized_zip) == 5):
+        await ctx.reply("Please provide a 5-digit zip code.")
+        return
+
+    zip_codes = get_zip_codes()
+    if normalized_zip in zip_codes:
+        await ctx.reply(f"{normalized_zip} is already in the zip list.")
+        return
+
+    zip_codes.append(normalized_zip)
+    state["zip_codes"] = zip_codes
+    save_state()
+    await ctx.reply(f"Added {normalized_zip}. Current zip codes: {', '.join(zip_codes)}")
 
 
 @busch.command(name="status")
@@ -410,7 +462,7 @@ async def busch_status(ctx):
 
     await ctx.reply(
         "Busch bot status:\n"
-        f"- fixed zip: {DEFAULT_ZIP}\n"
+        f"- zip codes: {', '.join(get_zip_codes())}\n"
         f"- fixed radius: {DEFAULT_RADIUS}\n"
         f"- check times UTC: {checks}\n"
         f"- update channel id: {update_channel}\n"
