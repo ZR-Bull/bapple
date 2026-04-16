@@ -2,8 +2,7 @@ import asyncio
 import json
 import logging
 import os
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -20,12 +19,21 @@ if not token:
     raise RuntimeError("DISCORD_TOKEN is not set in .env")
 
 URL = "https://api.beertech.com/singularity/graphql"
-CONFIG_PATH = BASE_DIR / "subscriptions.json"
+STATE_PATH = BASE_DIR / "busch_state.json"
 LOG_PATH = BASE_DIR / "discord.log"
+DEFAULT_ZIP = os.getenv("BUSCH_ZIP", "97333")
+DEFAULT_RADIUS = float(os.getenv("BUSCH_RADIUS", "25"))
+CHECK_TIMES_UTC = [
+    time_text.strip()
+    for time_text in os.getenv("BUSCH_CHECK_TIMES_UTC", "16:00,20:00,00:00").split(",")
+    if time_text.strip()
+]
 
-SEARCH_PRESETS = {
+TRACKED_CATEGORIES = {
     "apple": {
         "brand_name": "BUSCH LT APPLE",
+        "role_name": "Busch Apple Alerts",
+        "emoji": "🍎",
         "products": [
             "BUSCH LIGHT APPLE 30/12 OZ CAN DSTK",
             "BUSCH LIGHT APPLE 24/12 OZ CAN 2/12",
@@ -38,6 +46,8 @@ SEARCH_PRESETS = {
     },
     "lite": {
         "brand_name": "BUSCH LIGHT",
+        "role_name": "Busch Lite Alerts",
+        "emoji": "🍺",
         "products": [
             "BUSCH LIGHT 18/12 OZ NRLN",
             "BUSCH LIGHT 24/12 OZ CAN 2/12",
@@ -62,18 +72,10 @@ SEARCH_PRESETS = {
             "BUSCH LIGHT 24/16 OZ CAN 3/8",
         ],
     },
-    "ice": {
-        "brand_name": "BUSCH ICE",
-        "products": [
-            "BUSCH ICE 24/12 OZ CAN",
-            "BUSCH ICE 24/16 OZ CAN 4/6",
-            "BUSCH ICE 15/25 AL CAN SHRINK",
-            "BUSCH ICE 24/16 OZ CAN 6/4",
-            "BUSCH ICE 24/12 OZ CAN 2/12",
-        ],
-    },
     "peach": {
         "brand_name": "BUSCH LT PEACH",
+        "role_name": "Busch Peach Alerts",
+        "emoji": "🍑",
         "products": [
             "BUSCH LIGHT PEACH 30/12 OZ CAN DSTK",
             "BUSCH LIGHT PEACH 15/25 AL CAN SHRINK",
@@ -82,6 +84,10 @@ SEARCH_PRESETS = {
             "BUSCH LIGHT PEACH 24/12 OZ CAN 2/12",
         ],
     },
+}
+
+EMOJI_TO_CATEGORY = {
+    config["emoji"]: key for key, config in TRACKED_CATEGORIES.items()
 }
 
 HEADERS = {
@@ -97,65 +103,33 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-subscriptions = {}
+state = {
+    "role_panel_message_id": None,
+    "role_panel_channel_id": None,
+    "updates_channel_id": None,
+    "last_check_key": None,
+}
 
 
-def load_subscriptions():
-    if not CONFIG_PATH.exists():
-        return {}
+def load_state():
+    if not STATE_PATH.exists():
+        return
 
     try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        loaded_state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return {}
+        return
 
-    if not isinstance(raw, dict):
-        return {}
+    if not isinstance(loaded_state, dict):
+        return
 
-    return {
-        str(user_id): config
-        for user_id, config in raw.items()
-        if isinstance(config, dict)
-    }
+    for key in state:
+        if key in loaded_state:
+            state[key] = loaded_state[key]
 
 
-def save_subscriptions():
-    CONFIG_PATH.write_text(
-        json.dumps(subscriptions, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-
-
-def parse_key_values(text):
-    matches = list(re.finditer(r"(\w+)\s*=", text))
-    values = {}
-
-    for index, match in enumerate(matches):
-        key = match.group(1).lower()
-        start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        value = text[start:end].strip().strip('"').strip("'")
-        values[key] = value
-
-    return values
-
-
-def resolve_search_preset(values):
-    search_name = (values.get("product") or values.get("search") or values.get("type") or "apple").strip().lower()
-    if search_name == "light":
-        search_name = "lite"
-
-    preset = SEARCH_PRESETS.get(search_name)
-
-    if not preset:
-        allowed = ", ".join(sorted(SEARCH_PRESETS))
-        raise ValueError(f"product must be one of: {allowed}")
-
-    return search_name, preset["brand_name"], preset["products"]
-
-
-def format_products_label(product_label, products):
-    return product_label
+def save_state():
+    STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def build_query(brand_name, zip_code, radius, products):
@@ -195,16 +169,24 @@ def fetch_retailers(brand_name, zip_code, radius, products):
     return data.get("data", {}).get("locateRetailers", {}).get("retailers", [])
 
 
-def build_update_embed(config, retailers):
+async def ensure_role(guild, role_name):
+    role = discord.utils.get(guild.roles, name=role_name)
+    if role:
+        return role
+
+    try:
+        return await guild.create_role(name=role_name, mentionable=True, reason="Busch alert role setup")
+    except discord.Forbidden:
+        return None
+
+
+def build_update_embed(category_name, config, retailers):
     brand_name = config["brand_name"]
-    zip_code = config["zip_code"]
-    radius = config["radius"]
-    product_label = format_products_label(config["product_label"], config["products"])
 
     if retailers:
         embed = discord.Embed(
-            title=f"Busch stock found for {zip_code}",
-            description=f"{len(retailers)} retailer(s) matched your {brand_name} search.",
+            title=f"{category_name.title()} update: stock found",
+            description=f"{len(retailers)} retailer(s) matched {brand_name}.",
             color=discord.Color.green(),
         )
         top_spots = retailers[:5]
@@ -215,202 +197,152 @@ def build_update_embed(config, retailers):
         embed.add_field(name="Nearby results", value="\n".join(lines), inline=False)
     else:
         embed = discord.Embed(
-            title=f"No stock found for {zip_code}",
-            description=f"The locator did not return any nearby stores for {brand_name} right now.",
+            title=f"{category_name.title()} update: no stock",
+            description=f"The locator did not return nearby stores for {brand_name} right now.",
             color=discord.Color.red(),
         )
 
-    embed.add_field(name="Zip code", value=zip_code, inline=True)
-    embed.add_field(name="Radius", value=f"{radius} mi", inline=True)
-    embed.add_field(name="Products", value=product_label, inline=False)
+    embed.add_field(name="Zip code", value=DEFAULT_ZIP, inline=True)
+    embed.add_field(name="Radius", value=f"{DEFAULT_RADIUS} mi", inline=True)
+    embed.add_field(name="Brand", value=brand_name, inline=False)
     embed.set_footer(text=f"Checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     return embed
 
 
-def format_config(config):
-    product_label = format_products_label(config["product_label"], config["products"])
-    next_check = config.get("next_check")
-    if next_check:
-        next_check_text = next_check
-    else:
-        next_check_text = "not scheduled"
+def get_updates_channel(guild):
+    if state["updates_channel_id"]:
+        channel = guild.get_channel(int(state["updates_channel_id"]))
+        if isinstance(channel, discord.TextChannel):
+            return channel
 
-    channel_id = config.get("channel_id")
-    channel_text = f"<#{channel_id}>" if channel_id else "unknown"
+    if guild.system_channel:
+        state["updates_channel_id"] = guild.system_channel.id
+        save_state()
+        return guild.system_channel
 
-    return (
-        f"interval={config['interval_minutes']}m, zip={config['zip_code']}, "
-        f"radius={config['radius']}mi, products={product_label}, channel={channel_text}, "
-        f"next={next_check_text}"
-    )
+    for channel in guild.text_channels:
+        if channel.permissions_for(guild.me).send_messages:
+            state["updates_channel_id"] = channel.id
+            save_state()
+            return channel
 
-
-def build_config_from_values(ctx, values):
-    interval_text = values.get("interval") or values.get("interval_minutes") or values.get("minutes")
-    radius_text = values.get("radius")
-    zip_code = values.get("zip") or values.get("zipcode") or values.get("zip_code")
-
-    if not zip_code:
-        raise ValueError("Missing zip= or zip_code=")
-
-    interval_minutes = int(interval_text) if interval_text else 60
-    if interval_minutes < 1:
-        raise ValueError("interval must be at least 1 minute")
-
-    radius = float(radius_text) if radius_text else 25.0
-    if radius <= 0:
-        raise ValueError("radius must be greater than 0")
-
-    search_name, brand_name, products = resolve_search_preset(values)
-
-    now = datetime.now(timezone.utc)
-    return {
-        "interval_minutes": interval_minutes,
-        "zip_code": str(zip_code),
-        "radius": radius,
-        "search_name": search_name,
-        "brand_name": brand_name,
-        "products": products,
-        "product_label": search_name,
-        "channel_id": ctx.channel.id,
-        "guild_id": ctx.guild.id if ctx.guild else None,
-        "enabled": True,
-        "next_check": now.isoformat(),
-    }
+    return None
 
 
-async def send_update(target_channel, user, config, retailers):
-    embed = build_update_embed(config, retailers)
-    await target_channel.send(content=f"{user.mention} here is your Busch stock update.", embed=embed)
-
-
-async def run_check_for_user(user_id, config):
-    user = bot.get_user(int(user_id))
-    if user is None:
-        try:
-            user = await bot.fetch_user(int(user_id))
-        except discord.NotFound:
-            return
-
-    channel = bot.get_channel(config["channel_id"])
-    if channel is None and config.get("channel_id"):
-        try:
-            channel = await bot.fetch_channel(config["channel_id"])
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            channel = None
-
-    if channel is None:
-        try:
-            channel = await user.create_dm()
-        except discord.Forbidden:
-            return
-
-    retailers = await asyncio.to_thread(
-        fetch_retailers,
-        config["brand_name"],
-        config["zip_code"],
-        config["radius"],
-        config["products"],
-    )
-
-    await send_update(channel, user, config, retailers)
-
-
-@tasks.loop(seconds=60)
-async def poll_due_subscriptions():
-    now = datetime.now(timezone.utc)
-    due_users = []
-
-    for user_id, config in subscriptions.items():
-        if not config.get("enabled", True):
-            continue
-
-        next_check_text = config.get("next_check")
-        if not next_check_text:
-            due_users.append((user_id, config))
-            continue
-
-        try:
-            next_check = datetime.fromisoformat(next_check_text)
-        except ValueError:
-            due_users.append((user_id, config))
-            continue
-
-        if next_check.tzinfo is None:
-            next_check = next_check.replace(tzinfo=timezone.utc)
-
-        if next_check <= now:
-            due_users.append((user_id, config))
-
-    if not due_users:
-        return
-
-    grouped = {}
-    for user_id, config in due_users:
-        signature = (
-            config["zip_code"],
-            float(config["radius"]),
-            tuple(config["products"]),
-        )
-        grouped.setdefault(signature, []).append((user_id, config))
-
-    for _, items in grouped.items():
-        sample_config = items[0][1]
+async def run_all_category_checks(guild, channel):
+    for category_name, config in TRACKED_CATEGORIES.items():
         try:
             retailers = await asyncio.to_thread(
                 fetch_retailers,
-                sample_config["brand_name"],
-                sample_config["zip_code"],
-                sample_config["radius"],
-                sample_config["products"],
+                config["brand_name"],
+                DEFAULT_ZIP,
+                DEFAULT_RADIUS,
+                config["products"],
             )
         except Exception as exc:
-            print(f"Stock lookup failed: {exc}")
+            await channel.send(f"Stock lookup failed for {category_name}: {exc}")
             continue
 
-        for user_id, config in items:
-            user = bot.get_user(int(user_id))
-            if user is None:
-                try:
-                    user = await bot.fetch_user(int(user_id))
-                except discord.NotFound:
-                    continue
+        role = discord.utils.get(guild.roles, name=config["role_name"])
+        mention = role.mention if role else config["role_name"]
+        embed = build_update_embed(category_name, config, retailers)
 
-            channel = bot.get_channel(config["channel_id"])
-            if channel is None and config.get("channel_id"):
-                try:
-                    channel = await bot.fetch_channel(config["channel_id"])
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    channel = None
-
-            if channel is None:
-                try:
-                    channel = await user.create_dm()
-                except discord.Forbidden:
-                    continue
-
-            await send_update(channel, user, config, retailers)
-            config["next_check"] = (
-                datetime.now(timezone.utc) + timedelta(minutes=config["interval_minutes"])
-            ).isoformat()
-
-    save_subscriptions()
+        await channel.send(
+            content=f"{mention} {category_name.title()} stock update",
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
 
 
-@poll_due_subscriptions.before_loop
-async def before_poll_due_subscriptions():
+async def update_member_role(payload, is_add):
+    if payload.guild_id is None:
+        return
+
+    if state["role_panel_message_id"] is None:
+        return
+
+    if payload.message_id != int(state["role_panel_message_id"]):
+        return
+
+    emoji_text = str(payload.emoji)
+    category_name = EMOJI_TO_CATEGORY.get(emoji_text)
+    if not category_name:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    role_name = TRACKED_CATEGORIES[category_name]["role_name"]
+    role = discord.utils.get(guild.roles, name=role_name)
+    if role is None:
+        role = await ensure_role(guild, role_name)
+        if role is None:
+            return
+
+    member = guild.get_member(payload.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except discord.NotFound:
+            return
+
+    if member.bot:
+        return
+
+    try:
+        if is_add:
+            await member.add_roles(role, reason="Busch reaction role opt-in")
+        else:
+            await member.remove_roles(role, reason="Busch reaction role opt-out")
+    except discord.Forbidden:
+        pass
+
+
+@tasks.loop(seconds=60)
+async def run_scheduled_checks():
+    now = datetime.now(timezone.utc)
+    time_key = now.strftime("%H:%M")
+    if time_key not in CHECK_TIMES_UTC:
+        return
+
+    run_key = now.strftime("%Y-%m-%d %H:%M")
+    if state["last_check_key"] == run_key:
+        return
+
+    for guild in bot.guilds:
+        channel = get_updates_channel(guild)
+        if channel is None:
+            continue
+
+        await run_all_category_checks(guild, channel)
+
+    state["last_check_key"] = run_key
+    save_state()
+
+
+@run_scheduled_checks.before_loop
+async def before_run_scheduled_checks():
     await bot.wait_until_ready()
 
 
 @bot.event
 async def on_ready():
-    global subscriptions
-
-    subscriptions = load_subscriptions()
-    if not poll_due_subscriptions.is_running():
-        poll_due_subscriptions.start()
+    load_state()
+    if not run_scheduled_checks.is_running():
+        run_scheduled_checks.start()
 
     print(f"Ready as {bot.user}.")
+
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    await update_member_role(payload, is_add=True)
+
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    await update_member_role(payload, is_add=False)
 
 
 @bot.group(name="busch", invoke_without_command=True)
@@ -421,67 +353,93 @@ async def busch(ctx):
 async def send_help(ctx):
     await ctx.reply(
         "Commands:\n"
-        "- `!busch watch zip=97333 radius=25 interval=60 product=apple`\n"
-        "- `!busch watch zip=97331 radius=25 interval=60 product=lite`\n"
-        "- `!busch watch zip=97331 radius=25 interval=60 product=ice`\n"
-        "- `!busch watch zip=97331 radius=25 interval=60 product=peach`\n"
-        "- `!busch status`\n"
-        "- `!busch unwatch`\n"
-        "- `!busch products`\n"
+        "- `!busch setup` creates roles + pinned reaction panel in this channel\n"
+        "- `!busch channel` sets this channel as update channel\n"
+        "- `!busch checknow` runs stock checks right now\n"
+        "- `!busch status` shows schedule/channel/panel status\n"
         "- `!busch help`"
     )
 
 
-@busch.command(name="watch")
-async def busch_watch(ctx, *, args=""):
-    values = parse_key_values(args)
-
-    try:
-        config = build_config_from_values(ctx, values)
-    except Exception as exc:
-        await ctx.reply(
-            "Usage: `!busch watch zip=97333 radius=25 interval=60 product=apple`\n"
-            "Allowed products: `apple`, `lite`, `ice`, `peach`\n"
-            f"Error: {exc}"
-        )
+@busch.command(name="setup")
+@commands.has_permissions(manage_roles=True)
+async def busch_setup(ctx):
+    if ctx.guild is None:
+        await ctx.reply("Run this command in a server channel.")
         return
 
-    subscriptions[str(ctx.author.id)] = config
-    save_subscriptions()
+    role_lines = []
+    for category_name, config in TRACKED_CATEGORIES.items():
+        role = await ensure_role(ctx.guild, config["role_name"])
+        if role is None:
+            role_lines.append(f"- {category_name}: could not create/find role")
+        else:
+            role_lines.append(f"- {config['emoji']} -> {role.mention}")
 
-    await ctx.reply(
-        "Saved your Busch tracker. I will ping this channel with updates using:\n"
-        f"{format_config(config)}"
+    embed = discord.Embed(
+        title="Busch Alerts Role Panel",
+        description=(
+            "React to get alert roles. Remove your reaction to remove the role.\n\n"
+            + "\n".join(role_lines)
+        ),
+        color=discord.Color.blurple(),
     )
+
+    panel_message = await ctx.send(embed=embed)
+    for config in TRACKED_CATEGORIES.values():
+        await panel_message.add_reaction(config["emoji"])
+
+    try:
+        await panel_message.pin(reason="Busch alert role selector")
+    except discord.Forbidden:
+        pass
+
+    state["role_panel_message_id"] = panel_message.id
+    state["role_panel_channel_id"] = panel_message.channel.id
+    state["updates_channel_id"] = ctx.channel.id
+    save_state()
+
+    await ctx.reply("Setup complete. I pinned the role panel and set this as the update channel.")
 
 
 @busch.command(name="status")
 async def busch_status(ctx):
-    config = subscriptions.get(str(ctx.author.id))
-    if not config:
-        await ctx.reply("You do not have a saved tracker yet. Use `!busch watch` first.")
+    panel_id = state.get("role_panel_message_id")
+    update_channel = state.get("updates_channel_id")
+    checks = ", ".join(CHECK_TIMES_UTC)
+
+    await ctx.reply(
+        "Busch bot status:\n"
+        f"- fixed zip: {DEFAULT_ZIP}\n"
+        f"- fixed radius: {DEFAULT_RADIUS}\n"
+        f"- check times UTC: {checks}\n"
+        f"- update channel id: {update_channel}\n"
+        f"- role panel message id: {panel_id}"
+    )
+
+
+@busch.command(name="channel")
+@commands.has_permissions(manage_guild=True)
+async def busch_channel(ctx):
+    if ctx.guild is None:
+        await ctx.reply("Run this command in a server channel.")
         return
 
-    await ctx.reply(format_config(config))
+    state["updates_channel_id"] = ctx.channel.id
+    save_state()
+    await ctx.reply("This channel is now the scheduled updates channel.")
 
 
-@busch.command(name="unwatch")
-async def busch_unwatch(ctx):
-    if str(ctx.author.id) in subscriptions:
-        del subscriptions[str(ctx.author.id)]
-        save_subscriptions()
-        await ctx.reply("Removed your saved tracker.")
+@busch.command(name="checknow")
+@commands.has_permissions(manage_guild=True)
+async def busch_checknow(ctx):
+    if ctx.guild is None:
+        await ctx.reply("Run this command in a server channel.")
         return
 
-    await ctx.reply("You do not have a saved tracker to remove.")
-
-
-@busch.command(name="products")
-async def busch_products(ctx):
-    lines = ["Available presets:"]
-    for name in sorted(SEARCH_PRESETS):
-        lines.append(f"- {name}")
-    await ctx.reply("\n".join(lines))
+    await ctx.reply("Running checks now...")
+    await run_all_category_checks(ctx.guild, ctx.channel)
+    await ctx.send("Done.")
 
 
 @busch.command(name="help")
@@ -489,5 +447,15 @@ async def busch_help(ctx):
     await send_help(ctx)
 
 
-subscriptions = load_subscriptions()
+@busch_setup.error
+@busch_channel.error
+@busch_checknow.error
+async def busch_permission_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.reply("You do not have permission for that command.")
+        return
+    raise error
+
+
+load_state()
 bot.run(token, log_handler=handler, log_level=logging.INFO)
