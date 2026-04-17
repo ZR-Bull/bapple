@@ -445,7 +445,6 @@ async def busch_status(ctx):
 
 
 @busch.command(name="channel")
-@commands.has_permissions(manage_guild=True)
 async def busch_channel(ctx):
     if ctx.guild is None:
         await ctx.reply("Run this command in a server channel.")
