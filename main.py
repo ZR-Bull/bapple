@@ -218,7 +218,14 @@ def get_updates_channel(guild):
 
 
 async def run_all_category_checks(guild, channel):
-    for zip_code in get_zip_codes():
+    zip_codes = get_zip_codes()
+    if not zip_codes:
+        await channel.send("No zip codes are configured. Use `!busch zip <zipcode>` to add one.")
+        return
+
+    for zip_code in zip_codes:
+        results = {}
+        any_stock_found = False
         for category_name, config in TRACKED_CATEGORIES.items():
             try:
                 retailers = await asyncio.to_thread(
@@ -228,23 +235,58 @@ async def run_all_category_checks(guild, channel):
                     DEFAULT_RADIUS,
                     config["products"],
                 )
+                results[category_name] = retailers
+                if retailers:
+                    any_stock_found = True
             except Exception as exc:
                 await channel.send(f"Stock lookup failed for {category_name} at {zip_code}: {exc}")
-                continue
+                results[category_name] = None
 
-            embed = build_update_embed(category_name, config, zip_code, retailers)
-            if retailers:
-                role = discord.utils.get(guild.roles, name=config["role_name"])
-                mention = role.mention if role else config["role_name"]
-                content = f"{mention} {category_name.title()} stock update for {zip_code}"
+        embed = discord.Embed(
+            title=f"Stock Check for {zip_code}",
+            color=discord.Color.green() if any_stock_found else discord.Color.red(),
+        )
+
+        for category_name, retailers in results.items():
+            config = TRACKED_CATEGORIES[category_name]
+            emoji = config["emoji"]
+            field_name = f"{category_name.title()} {emoji}"
+            
+            if retailers is None:
+                field_value = "Error during lookup."
+            elif retailers:
+                top_spots = retailers[:3]
+                lines = [
+                    f"• {spot.get('name', 'Unknown')} ({spot.get('distance', '?')} mi)"
+                    for spot in top_spots
+                ]
+                if len(retailers) > 3:
+                    lines.append(f"• and {len(retailers) - 3} more...")
+                field_value = "\n".join(lines)
             else:
-                content = f"{category_name.title()} stock update for {zip_code}"
+                field_value = "No stock found."
+            
+            embed.add_field(name=field_name, value=field_value, inline=False)
 
-            await channel.send(
-                content=content,
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions(roles=True),
-            )
+        embed.set_footer(text=f"Checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        
+        content = None
+        if any_stock_found:
+            mentions = []
+            for category_name, retailers in results.items():
+                if retailers:
+                    config = TRACKED_CATEGORIES[category_name]
+                    role = discord.utils.get(guild.roles, name=config["role_name"])
+                    if role:
+                        mentions.append(role.mention)
+            if mentions:
+                content = " ".join(mentions)
+
+        await channel.send(
+            content=content,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
 
 
 async def update_member_role(payload, is_add):
