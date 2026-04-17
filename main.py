@@ -470,6 +470,25 @@ async def busch_zip(ctx, zip_code=None):
     await ctx.reply(f"Added {normalized_zip}. Current zip codes: {', '.join(zip_codes)}")
 
 
+@busch.command(name="removezip")
+async def busch_removezip(ctx, zip_code=None):
+    if zip_code is None:
+        await ctx.reply("Usage: `!busch removezip <zipcode>`")
+        return
+
+    normalized_zip = str(zip_code).strip()
+    zip_codes = get_zip_codes()
+
+    if normalized_zip not in zip_codes:
+        await ctx.reply(f"{normalized_zip} is not in the zip list.")
+        return
+
+    zip_codes.remove(normalized_zip)
+    state["zip_codes"] = zip_codes
+    save_state()
+    await ctx.reply(f"Removed {normalized_zip}. Current zip codes: {', '.join(zip_codes)}")
+
+
 @busch.command(name="status")
 async def busch_status(ctx):
     panel_id = state.get("role_panel_message_id")
