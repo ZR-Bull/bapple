@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +19,30 @@ load_dotenv(BASE_DIR / ".env")
 token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise RuntimeError("DISCORD_TOKEN is not set in .env")
+
+ALERT_SOUND_PATH = os.getenv("BUSCH_ALERT_SOUND_PATH", str(BASE_DIR / "busch_alert.mp3"))
+ALERT_MAX_DURATION_SECONDS = int(os.getenv("BUSCH_ALERT_MAX_DURATION_SECONDS", "20"))
+
+
+def detect_voice_runtime_issue():
+    try:
+        import nacl  # noqa: F401
+    except Exception:
+        return (
+            "PyNaCl is not installed for this interpreter",
+            f"{sys.executable} -m pip install pynacl",
+        )
+
+    if shutil.which("ffmpeg") is None:
+        return (
+            "ffmpeg is not installed or not on PATH",
+            "Install ffmpeg (Ubuntu: sudo apt-get install -y ffmpeg)",
+        )
+
+    return None, None
+
+
+VOICE_RUNTIME_ISSUE, VOICE_RUNTIME_FIX = detect_voice_runtime_issue()
 
 URL = "https://api.beertech.com/singularity/graphql"
 LOCATOR_URL = "https://www.busch.com/locator"
@@ -217,11 +243,105 @@ def get_updates_channel(guild):
     return None
 
 
+def get_busiest_voice_channel(guild):
+    best_channel = None
+    best_count = 0
+
+    for channel in guild.voice_channels:
+        member_count = sum(1 for member in channel.members if not member.bot)
+        if member_count <= 0:
+            continue
+
+        me = guild.me
+        if me is None:
+            continue
+
+        permissions = channel.permissions_for(me)
+        if not (permissions.connect and permissions.speak):
+            continue
+
+        if member_count > best_count:
+            best_channel = channel
+            best_count = member_count
+
+    return best_channel, best_count
+
+
+async def play_voice_alert(guild, report_channel):
+    if VOICE_RUNTIME_ISSUE:
+        await report_channel.send(
+            "Stock found, but voice alert is unavailable: "
+            f"{VOICE_RUNTIME_ISSUE}. Running interpreter: {sys.executable}. "
+            f"Fix: {VOICE_RUNTIME_FIX}"
+        )
+        return
+
+    sound_file = Path(ALERT_SOUND_PATH)
+    if not sound_file.is_absolute():
+        sound_file = (BASE_DIR / sound_file).resolve()
+
+    if not sound_file.exists():
+        await report_channel.send(
+            f"Stock found, but alert sound file is missing: {sound_file}. "
+            "Set BUSCH_ALERT_SOUND_PATH in .env."
+        )
+        return
+
+    voice_channel, member_count = get_busiest_voice_channel(guild)
+    if voice_channel is None:
+        return
+
+    voice_client = guild.voice_client
+    try:
+        if voice_client is None or not voice_client.is_connected():
+            voice_client = await voice_channel.connect()
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
+
+        if voice_client.is_playing():
+            voice_client.stop()
+
+        # Prefer opus output from ffmpeg so a system libopus is not required in Python.
+        source = None
+        try:
+            source = await discord.FFmpegOpusAudio.from_probe(str(sound_file))
+        except Exception:
+            source = discord.FFmpegPCMAudio(str(sound_file))
+        voice_client.play(source)
+
+        await report_channel.send(
+            f"Stock found. Playing alert in **{voice_channel.name}** "
+            f"({member_count} listener(s))."
+        )
+
+        waited_seconds = 0
+        while voice_client.is_playing() and waited_seconds < ALERT_MAX_DURATION_SECONDS:
+            await asyncio.sleep(1)
+            waited_seconds += 1
+
+        if voice_client.is_playing():
+            voice_client.stop()
+
+        await voice_client.disconnect()
+    except Exception as exc:
+        await report_channel.send(
+            "Stock found, but voice alert failed: "
+            f"{exc}. Interpreter: {sys.executable}"
+        )
+        if voice_client and voice_client.is_connected():
+            try:
+                await voice_client.disconnect()
+            except Exception:
+                pass
+
+
 async def run_all_category_checks(guild, channel):
     zip_codes = get_zip_codes()
     if not zip_codes:
         await channel.send("No zip codes are configured. Use `!busch zip <zipcode>` to add one.")
         return
+
+    stock_found_during_run = False
 
     for zip_code in zip_codes:
         results = {}
@@ -238,6 +358,7 @@ async def run_all_category_checks(guild, channel):
                 results[category_name] = retailers
                 if retailers:
                     any_stock_found = True
+                    stock_found_during_run = True
             except Exception as exc:
                 await channel.send(f"Stock lookup failed for {category_name} at {zip_code}: {exc}")
                 results[category_name] = None
@@ -287,6 +408,9 @@ async def run_all_category_checks(guild, channel):
             embed=embed,
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
+
+    if stock_found_during_run:
+        await play_voice_alert(guild, channel)
 
 
 async def update_member_role(payload, is_add):
@@ -366,6 +490,16 @@ async def on_ready():
     load_state()
     if not run_scheduled_checks.is_running():
         run_scheduled_checks.start()
+
+    if VOICE_RUNTIME_ISSUE:
+        print(
+            "Voice alerts are not ready:",
+            VOICE_RUNTIME_ISSUE,
+            "| Interpreter:",
+            sys.executable,
+            "| Fix:",
+            VOICE_RUNTIME_FIX,
+        )
 
     print(f"Ready as {bot.user}.")
 
